@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "register": "node src/register-commands.js"
+    "register": "node src/register-commands.js",
+    "build": "node --check src/index.js && node --check src/register-commands.js"
   },
   "dependencies": {
     "discord.js": "^14.19.3",
