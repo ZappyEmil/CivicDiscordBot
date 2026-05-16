@@ -14,6 +14,9 @@ const clientId = process.env.CLIENT_ID;
 const guildId = process.env.GUILD_ID;
 const githubToken = process.env.GITHUB_TOKEN;
 
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_WEBHOOK_ATTEMPTS = 3;
+
 const repos = {
   political: {
     label: 'Political briefing',
@@ -57,6 +60,23 @@ function repoPath(config) {
   return `${config.owner}/${config.repo}`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isDiscordWebhookUrl(value) {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      ['discord.com', 'discordapp.com'].includes(url.hostname) &&
+      url.pathname.startsWith('/api/webhooks/')
+    );
+  } catch {
+    return false;
+  }
+}
+
 function githubHeaders() {
   return {
     Accept: 'application/vnd.github+json',
@@ -66,13 +86,29 @@ function githubHeaders() {
   };
 }
 
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function limitedResponseText(response) {
+  const body = await response.text().catch(() => '');
+  return body.length > 500 ? `${body.slice(0, 500)}...` : body;
+}
+
 async function dispatchWorkflow(config, inputs = {}) {
   if (!githubToken) {
     throw new Error('GITHUB_TOKEN is missing.');
   }
 
   const url = `https://api.github.com/repos/${config.owner}/${config.repo}/actions/workflows/${config.workflow}/dispatches`;
-  const response = await fetch(url, {
+  console.log(`Dispatching workflow ${config.workflow} in ${repoPath(config)}.`);
+  const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: githubHeaders(),
     body: JSON.stringify({ ref: 'main', inputs }),
@@ -80,16 +116,21 @@ async function dispatchWorkflow(config, inputs = {}) {
 
   if (response.status === 204) return;
 
-  const body = await response.text().catch(() => '');
-  throw new Error(`GitHub workflow dispatch failed: ${response.status} ${response.statusText} ${body}`);
+  const body = await limitedResponseText(response);
+  throw new Error(`GitHub workflow dispatch failed: ${response.status} ${response.statusText} ${body}`.trim());
 }
 
-async function postWebhook(config, message) {
+async function postWebhook(config, message, attempt = 1) {
   if (!config.webhookUrl) {
     throw new Error(`${config.label} webhook URL is missing.`);
   }
 
-  const response = await fetch(config.webhookUrl, {
+  if (!isDiscordWebhookUrl(config.webhookUrl)) {
+    throw new Error(`${config.label} webhook URL must start with https://discord.com/api/webhooks/.`);
+  }
+
+  console.log(`Sending ${config.label} webhook test, attempt ${attempt}/${MAX_WEBHOOK_ATTEMPTS}.`);
+  const response = await fetchWithTimeout(config.webhookUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -105,9 +146,25 @@ async function postWebhook(config, message) {
     }),
   });
 
+  if (response.status === 429 && attempt < MAX_WEBHOOK_ATTEMPTS) {
+    const body = await response.json().catch(() => null);
+    const retryAfterSeconds = typeof body?.retry_after === 'number' ? body.retry_after : 1;
+    const waitMs = Math.ceil(retryAfterSeconds * 1000) + 250;
+    console.warn(`Discord rate limited ${config.label}. Waiting ${waitMs}ms before retry.`);
+    await sleep(waitMs);
+    return postWebhook(config, message, attempt + 1);
+  }
+
+  if (response.status >= 500 && attempt < MAX_WEBHOOK_ATTEMPTS) {
+    const waitMs = attempt * 1000;
+    console.warn(`Discord webhook returned ${response.status} for ${config.label}. Retrying in ${waitMs}ms.`);
+    await sleep(waitMs);
+    return postWebhook(config, message, attempt + 1);
+  }
+
   if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Discord webhook failed: ${response.status} ${response.statusText} ${body}`);
+    const body = await limitedResponseText(response);
+    throw new Error(`Discord webhook failed after ${attempt} attempt(s): ${response.status} ${response.statusText} ${body}`.trim());
   }
 }
 
@@ -154,11 +211,12 @@ async function registerCommands() {
     return;
   }
 
+  const commands = commandDefinitions();
   const rest = new REST({ version: '10' }).setToken(token);
   await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
-    body: commandDefinitions(),
+    body: commands,
   });
-  console.log('Registered slash commands for this server.');
+  console.log(`Registered ${commands.length} slash commands for this server.`);
 }
 
 async function handleStatus(interaction) {
